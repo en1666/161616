@@ -3,23 +3,61 @@ import mediapipe as mp
 import numpy as np
 import screeninfo
 import os
-import time
+import pyttsx3
+import threading
 
-# --- 設定區 ---
 VIDEO_FILE = r'C:\Users\User\Desktop\media\0209v\5.雙手側舉0209.mp4' 
-REPS_PER_LEG = 5  
+TARGET_REPS = 10 
+
+speech_engine = None
+
+def speak(text):
+    global speech_engine
+    def _say():
+        global speech_engine
+        try:
+            speech_engine = pyttsx3.init()
+            speech_engine.setProperty('rate', 150)
+            speech_engine.say(text)
+            speech_engine.runAndWait()
+        except:
+            pass
+    threading.Thread(target=_say, daemon=True).start()
+
+def stop_speech():
+    global speech_engine
+    try:
+        if speech_engine:
+            speech_engine.stop()
+    except:
+        pass
 
 should_exit = False
+skip_demo = False
+is_paused = False
+current_frame_idx = 0
+
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(min_detection_confidence=0.8, min_tracking_confidence=0.8)
 mp_drawing = mp.solutions.drawing_utils
 
 def click_event(event, x, y, flags, param):
-    global should_exit
-    sw, sh = param
+    global should_exit, skip_demo, is_paused, current_frame_idx
+    mode, sw, sh, total_frames = param
     if event == cv2.EVENT_LBUTTONDOWN:
-        if 0 < x < 250 and (sh - 150) < y < sh:
+        if 0 < x < 200 and (sh - 100) < y < sh:
             should_exit = True
+            stop_speech()
+            return
+        if mode == "DEMO":
+            if (sw - 200) < x < sw and (sh - 100) < y < sh:
+                skip_demo = True
+                stop_speech()
+            elif 50 < x < (sw - 50) and (sh - 135) < y < (sh - 100):
+                progress_ratio = (x - 50) / (sw - 100)
+                current_frame_idx = int(progress_ratio * (total_frames - 1))
+            else:
+                is_paused = not is_paused
 
 def letterbox_image(image, target_w, target_h):
     h, w = image.shape[:2]
@@ -38,135 +76,142 @@ def letterbox_image(image, target_w, target_h):
     return canvas
 
 def crop_to_fill_top(image, target_w, target_h):
-    """
-    修正後的裁切邏輯：保留影像頂部，確保側舉時能看到手部。
-    """
-    h, w = image.shape[:2]
-    if (w/h) > (target_w/target_h):
-        # 影像太寬，裁切兩邊
-        new_w = int(h * (target_w/target_h))
-        offset = (w - new_w) // 2
-        crop = image[:, offset:offset+new_w]
+    """垂直置中裁切邏輯，確保捕捉到上半身而非天花板"""
+    h_img, w_img = image.shape[:2]
+    aspect = w_img / h_img
+    target_aspect = target_w / target_h
+    
+    if aspect < target_aspect:
+        raw_crop_w = w_img
+        raw_crop_h = int(raw_crop_w * (target_h / target_w))
+        raw_y_off = int((h_img - raw_crop_h) * 0.6) # 45% 視角中心下放
+        raw_y_off = max(0, min(raw_y_off, h_img - raw_crop_h))
+        crop = image[raw_y_off:raw_y_off+raw_crop_h, :]
     else:
-        # 影像太長，裁切下方，保留上方
-        new_h = int(w * (target_h/target_w))
-        # 將 offset 設為 0，代表從最頂部開始取影像
-        offset = 0 
-        crop = image[offset:offset+new_h, :]
-    return cv2.resize(crop, (target_w, target_h))
-
-def draw_exit_button(img, sh):
-    cv2.rectangle(img, (0, sh-150), (250, sh), (50, 50, 200), -1)
-    cv2.putText(img, "TOUCH TO", (35, sh-90), 1, 2, (255, 255, 255), 2)
-    cv2.putText(img, "EXIT", (35, sh-40), 1, 2, (255, 255, 255), 2)
+        raw_crop_h = h_img
+        raw_crop_w = int(raw_crop_h * (target_w / target_h))
+        raw_x_off = (w_img - raw_crop_w) // 2
+        crop = image[:, raw_x_off:raw_x_off+raw_crop_w]
+        
+    return cv2.resize(crop, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
 def run_trainer():
-    global should_exit
+    global should_exit, skip_demo, is_paused, current_frame_idx
     try:
         monitors = screeninfo.get_monitors()
         sw, sh = monitors[0].width, monitors[0].height
     except:
         sw, sh = 1280, 720
 
-    if not os.path.exists(VIDEO_FILE):
-        print(f"找不到檔案: {VIDEO_FILE}")
-        return
+    if not os.path.exists(VIDEO_FILE): return
 
     win_name = 'AI Trainer'
     cv2.namedWindow(win_name, cv2.WND_PROP_FULLSCREEN)
     cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    cv2.setMouseCallback(win_name, click_event, param=(sw, sh))
 
-    # --- 1. 全螢幕播放示範 (修正播放延遲) ---
     demo_cap = cv2.VideoCapture(VIDEO_FILE)
-    fps = demo_cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0: fps = 30
-    wait_ms = int(1000 / fps)
-    
-    demo_frames = []
-    while demo_cap.isOpened():
+    fps = demo_cap.get(cv2.CAP_PROP_FPS) or 30
+    all_frames = []
+    while True:
         ret, frame = demo_cap.read()
-        if not ret or should_exit: break
-        
-        display_frame = letterbox_image(frame, sw, sh)
-        draw_exit_button(display_frame, sh)
-        cv2.imshow(win_name, display_frame)
-        
-        if cv2.waitKey(wait_ms) & 0xFF == 27: 
-            should_exit = True
-            break
-        demo_frames.append(frame)
+        if not ret: break
+        all_frames.append(frame)
     demo_cap.release()
+    
+    cv2.setMouseCallback(win_name, click_event, param=("DEMO", sw, sh, len(all_frames)))
+    speak("你好，請觀察雙手側舉動作，完成後點擊右下角跳過。")
 
-    if should_exit: return
-
-    # --- 2. 實時計次 ---
-    cap = cv2.VideoCapture(0)
-    left_reps, right_reps = 0, 0
-    current_side = "RIGHT" 
-    stage = "down"
-    start_time = time.time()
-
-    while cap.isOpened() and not should_exit:
-        success, frame = cap.read()
-        if not success: break
+    while not skip_demo and not should_exit:
+        raw_frame = all_frames[current_frame_idx].copy()
+        display_frame = letterbox_image(raw_frame, sw, sh)
         
-        frame = cv2.flip(frame, 1) 
-        frame_display = frame.copy()
-        frame_display = letterbox_image(frame_display, sw, sh)
+        overlay = display_frame.copy()
+        cv2.rectangle(overlay, (0, sh-130), (sw, sh), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0, display_frame)
         
-        results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        color = (0, 0, 255)
+        bar_start, bar_end = 50, sw-50
+        cv2.line(display_frame, (bar_start, sh-110), (bar_end, sh-110), (80, 80, 80), 4)
+        prog_x = bar_start + int((current_frame_idx / (len(all_frames)-1)) * (bar_end - bar_start))
+        cv2.line(display_frame, (bar_start, sh-110), (prog_x, sh-110), (0, 0, 255), 6)
+        cv2.circle(display_frame, (prog_x, sh-110), 8, (0, 0, 255), -1)
 
-        if results.pose_landmarks:
-            lm = results.pose_landmarks.landmark
-            if current_side == "RIGHT":
-                elbow = lm[mp_pose.PoseLandmark.LEFT_ELBOW] 
-                shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
-            else:
-                elbow = lm[mp_pose.PoseLandmark.RIGHT_ELBOW]
-                shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-
-            if elbow.visibility > 0.7 and shoulder.visibility > 0.7:
-                # 側舉：手肘上抬至肩膀高度
-                if elbow.y < shoulder.y + 0.10: 
-                    stage = "up"
-                elif elbow.y > shoulder.y + 0.25 and stage == "up":
-                    stage = "down"
-                    if current_side == "RIGHT":
-                        right_reps += 1
-                        if right_reps >= REPS_PER_LEG:
-                            current_side = "LEFT"
-                            stage = "down"
-                    else:
-                        left_reps += 1
-
-            is_correct = (elbow.y < shoulder.y + 0.10) if elbow.visibility > 0.7 else False
-            color = (0, 255, 0) if is_correct else (0, 0, 255)
-            mp_drawing.draw_landmarks(frame_display, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-
-        # UI 顯示
-        cv2.rectangle(frame_display, (0, 0), (sw, 100), (30, 30, 30), -1)
-        r_color = (0, 255, 255) if current_side == "RIGHT" else (255, 255, 255)
-        l_color = (0, 255, 255) if current_side == "LEFT" else (255, 255, 255)
+        curr_time = f"{int(current_frame_idx/fps)//60:02d}:{int(current_frame_idx/fps)%60:02d}"
+        total_time = f"{int(len(all_frames)/fps)//60:02d}:{int(len(all_frames)/fps)%60:02d}"
+        cv2.putText(display_frame, f"{curr_time} / {total_time}", (50, sh-60), 1, 1.5, (255, 255, 255), 2)
+        cv2.putText(display_frame, "PAUSED" if is_paused else "PLAYING", (sw//2-60, sh-60), 1, 1.5, (0, 255, 255), 2)
         
-        cv2.putText(frame_display, f"RIGHT: {right_reps}/{REPS_PER_LEG}", (40, 65), 1, 2.5, r_color, 3)
-        cv2.putText(frame_display, f"LEFT: {left_reps}/{REPS_PER_LEG}", (450, 65), 1, 2.5, l_color, 3)
-        cv2.putText(frame_display, "LATERAL RAISE", (sw - 500, 65), 1, 2.8, (255, 255, 255), 3)
-        draw_exit_button(frame_display, sh)
+        cv2.rectangle(display_frame, (0, sh-50), (150, sh), (50, 50, 200), -1)
+        cv2.putText(display_frame, "EXIT", (45, sh-15), 1, 1.5, (255, 255, 255), 2)
+        cv2.rectangle(display_frame, (sw-150, sh-50), (sw, sh), (200, 50, 50), -1)
+        cv2.putText(display_frame, "SKIP >>", (sw-135, sh-15), 1, 1.5, (255, 255, 255), 2)
 
-        # 順暢示範影片 (確保裁切保留頂部)
-        elapsed = time.time() - start_time
-        demo_idx = int(elapsed * fps) % len(demo_frames)
-        thumb = crop_to_fill_top(demo_frames[demo_idx], 400, 300)
-        frame_display[sh-320:sh-20, sw-420:sw-20] = thumb
-        cv2.rectangle(frame_display, (sw-420, sh-320), (sw-20, sh-20), color, 5)
-
-        cv2.imshow(win_name, frame_display)
-        if cv2.waitKey(1) & 0xFF == 27 or (left_reps >= REPS_PER_LEG):
+        cv2.imshow(win_name, display_frame)
+        if cv2.waitKey(20) & 0xFF == 27: 
+            should_exit = True
+            stop_speech()
             break
+        if not is_paused:
+            current_frame_idx += 1
+            if current_frame_idx >= len(all_frames): break
 
-    cap.release()
+    if not should_exit:
+        cv2.setMouseCallback(win_name, click_event, param=("LIVE", sw, sh, 0))
+        cap = cv2.VideoCapture(0)
+        reps = 0
+        stage = "down"
+        demo_idx = 0
+
+        speak(f"現在開始訓練，請雙手同時側舉，目標{TARGET_REPS}次。")
+
+        while cap.isOpened() and not should_exit:
+            success, frame = cap.read()
+            if not success: break
+            
+            frame = cv2.flip(frame, 1)
+            frame_display = letterbox_image(frame, sw, sh)
+            results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            color = (0, 0, 255)
+
+            if results.pose_landmarks:
+                lm = results.pose_landmarks.landmark
+                l_elbow, r_elbow = lm[mp_pose.PoseLandmark.LEFT_ELBOW], lm[mp_pose.PoseLandmark.RIGHT_ELBOW]
+                l_shoulder, r_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER], lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+
+                if all(pt.visibility > 0.7 for pt in [l_elbow, r_elbow, l_shoulder, r_shoulder]):
+                    if l_elbow.y < l_shoulder.y + 0.12 and r_elbow.y < r_shoulder.y + 0.12:
+                        stage = "up"
+                        color = (0, 255, 0)
+                    elif l_elbow.y > l_shoulder.y + 0.25 and r_elbow.y > r_shoulder.y + 0.25 and stage == "up":
+                        stage = "down"
+                        reps += 1
+                        speak(str(reps))
+
+                mp_drawing.draw_landmarks(frame_display, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+            cv2.rectangle(frame_display, (0, 0), (sw, 100), (30, 30, 30), -1)
+            cv2.putText(frame_display, f"REPS: {reps} / {TARGET_REPS}", (40, 65), 1, 2.5, (0, 255, 255), 3)
+            cv2.putText(frame_display, "LATERAL RAISE", (sw - 500, 65), 1, 2.8, (255, 255, 255), 3)
+
+            cv2.rectangle(frame_display, (0, sh-60), (150, sh), (50, 50, 200), -1)
+            cv2.putText(frame_display, "EXIT", (45, sh-20), 1, 1.5, (255, 255, 255), 2)
+
+            thumb_w, thumb_h = 400, 300
+            thumb = crop_to_fill_top(all_frames[demo_idx], thumb_w, thumb_h)
+            frame_display[sh-thumb_h-20:sh-20, sw-thumb_w-20:sw-20] = thumb
+            cv2.rectangle(frame_display, (sw-thumb_w-20, sh-thumb_h-20), (sw-20, sh-20), color, 5)
+
+            cv2.imshow(win_name, frame_display)
+            demo_idx = (demo_idx + 1) % len(all_frames)
+            
+            if cv2.waitKey(1) & 0xFF == 27: 
+                stop_speech()
+                break
+            if reps >= TARGET_REPS:
+                speak("太棒了，側舉動作完美完成！")
+                cv2.waitKey(2000)
+                break
+
+        cap.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
